@@ -18,7 +18,7 @@ setup(
     python_requires='>=3.10',
     author="Pingyue Zhang",
     description="Theory of Space",
-    long_description=open("README.md", "r").read() if os.path.exists("README.md") else "",
+    long_description=open("README.md", "r", encoding="utf-8").read() if os.path.exists("README.md") else "",
     long_description_content_type="text/markdown",
     install_requires=read_requirements(),
     url="",

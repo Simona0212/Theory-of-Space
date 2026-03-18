@@ -139,6 +139,61 @@ def setup_vllm_server(model_path: str, port: int, gpu_id: int):
     return None, None
 
 
+def setup_bagel_server(model_path: str, port: int, gpu_id: int):
+    """Start BAGEL server with OpenAI-compatible API."""
+    model_name = sanitize_model_name(model_path)
+
+    # Check for BAGEL-specific conda environment
+    bagel_env_python = os.path.expanduser("~/miniconda3/envs/bagel/bin/python")
+    if os.path.exists(bagel_env_python):
+        print("Using BAGEL-specific conda environment")
+        python_exec = bagel_env_python
+    else:
+        print("Using current Python environment")
+        python_exec = sys.executable
+
+    cmd = [
+        python_exec,
+        "bagel_server.py",
+        "--model-path", model_path,
+        "--port", str(port),
+        "--host", "0.0.0.0",
+    ]
+
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+
+    print(f"Starting BAGEL server for {model_path} on GPU {gpu_id}, port {port}...")
+    print(f"Command: {' '.join(cmd)}")
+
+    proc = subprocess.Popen(
+        cmd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1
+    )
+
+    # Wait for server to be ready
+    print("Waiting for BAGEL server to start...")
+    max_wait = 600  # 10 minutes (BAGEL takes longer to load)
+    start_time = time.time()
+
+    while time.time() - start_time < max_wait:
+        try:
+            import requests
+            response = requests.get(f"http://localhost:{port}/health", timeout=2)
+            if response.status_code == 200:
+                print(f"✓ BAGEL server ready on port {port}")
+                return proc, model_name
+        except:
+            pass
+        time.sleep(5)
+
+    raise RuntimeError(f"BAGEL server failed to start within {max_wait}s")
+
+
 def update_model_config(model_path: str, served_model_name: str, port: int):
     """Update base_model_config.yaml with the new model configuration."""
     config_path = Path("scripts/SpatialGym/base_model_config.yaml")
@@ -211,7 +266,12 @@ def run_spatial_gym_evaluation(
     print(f"Command: {' '.join(cmd)}")
     print("="*80 + "\n")
 
-    result = subprocess.run(cmd, check=True)
+    result = subprocess.run(
+        cmd,
+        check=True,
+        cwd=os.getcwd(),
+        env=os.environ.copy()
+    )
 
     if result.returncode == 0:
         print(f"\n✓ Evaluation completed successfully!")
@@ -219,36 +279,6 @@ def run_spatial_gym_evaluation(
     else:
         print(f"\n✗ Evaluation failed with return code {result.returncode}")
         sys.exit(result.returncode)
-
-
-def handle_bagel_model(model_path: str, args):
-    """Special handling for BAGEL model which requires custom setup."""
-    print("\n" + "="*80)
-    print("BAGEL Model Setup")
-    print("="*80)
-    print("\n⚠️  WARNING: BAGEL model requires special setup!")
-    print("\nPlease ensure you have:")
-    print("1. Installed BAGEL dependencies: cd Bagel && pip install -r requirements.txt")
-    print("2. Downloaded the BAGEL-7B-MoT model checkpoint")
-    print("3. The Bagel directory is properly configured")
-    print("\nBAGEL cannot use vLLM and requires custom inference code.")
-    print("You may need to manually integrate BAGEL inference logic.")
-    print("\nFor now, this script will skip BAGEL evaluation.")
-    print("Please refer to Bagel/EVAL.md for manual evaluation instructions.")
-    print("="*80 + "\n")
-
-    response = input("Do you want to continue anyway? (yes/no): ").strip().lower()
-    if response != "yes":
-        print("Exiting...")
-        sys.exit(0)
-
-    # For BAGEL, we would need custom integration
-    # This is a placeholder - actual BAGEL integration would require
-    # modifying the vagen inference pipeline to support BAGEL's API
-    raise NotImplementedError(
-        "BAGEL integration requires custom inference logic. "
-        "Please refer to Bagel/EVAL.md and manually integrate BAGEL inference."
-    )
 
 
 def main():
@@ -273,19 +303,25 @@ def main():
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_id)
     print(f"Using GPU: {args.gpu_id}")
 
-    # Handle BAGEL specially
-    if get_model_family(args.model_path) == "bagel":
-        handle_bagel_model(args.model_path, args)
-        return
-
-    vllm_proc = None
+    server_proc = None
     try:
-        # Start vLLM server
-        vllm_proc, served_model_name = setup_vllm_server(
-            args.model_path,
-            args.vllm_port,
-            args.gpu_id
-        )
+        # Determine model family and start appropriate server
+        model_family = get_model_family(args.model_path)
+
+        if model_family == "bagel":
+            # Start BAGEL server
+            server_proc, served_model_name = setup_bagel_server(
+                args.model_path,
+                args.vllm_port,
+                args.gpu_id
+            )
+        else:
+            # Start vLLM server for Qwen/LLaVA models
+            server_proc, served_model_name = setup_vllm_server(
+                args.model_path,
+                args.vllm_port,
+                args.gpu_id
+            )
 
         # Update model configuration
         model_key = update_model_config(
@@ -317,15 +353,15 @@ def main():
         sys.exit(1)
 
     finally:
-        # Cleanup vLLM server
-        if vllm_proc:
-            print("\nStopping vLLM server...")
-            vllm_proc.terminate()
+        # Cleanup server (vLLM or BAGEL)
+        if server_proc:
+            print("\nStopping server...")
+            server_proc.terminate()
             try:
-                vllm_proc.wait(timeout=10)
+                server_proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                vllm_proc.kill()
-            print("✓ vLLM server stopped")
+                server_proc.kill()
+            print("✓ Server stopped")
 
 
 if __name__ == "__main__":
